@@ -1,2157 +1,745 @@
-import sys
+"""DINGDING Minecraft Launcher — local versions and local instances."""
+
+from __future__ import annotations
+
 import os
-import json
-import platform
 import subprocess
-import zipfile
-import shutil
+import sys
 import threading
+import time
+from collections import deque
 from pathlib import Path
 
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QHBoxLayout,
-    QListWidget,
-    QComboBox,
-    QFileDialog,
-    QTextEdit,
-    QLineEdit,
-    QSpinBox,
-    QMessageBox
+    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout, QLabel,
+    QInputDialog, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
-from PySide6.QtCore import QObject, Signal
-import msal
-import requests
-CURRENT_OS = "windows"
-CURRENT_ARCH = platform.machine().lower()
 
+import launcher_settings
+from launcher_auth import login_microsoft as authenticate_microsoft
+from launcher_display import apply_borderless_when_ready, launcher_monitor_bounds, prepare_window_options
+from launcher_core import (
+    Account, JavaInfo, LauncherError, build_launch_plan, cleanup_natives,
+    extract_natives, find_java, find_minecraft_versions, find_modpack_instances,
+    find_local_modpack_versions, resolve_local_modpack, build_version_entries, detect_version_type, VERSION_TYPE_LABELS,
+    get_library_jars, get_offline_uuid, get_required_java_version, inspect_java,
+    load_config as read_config, load_version, prepare_legacy_assets, redact_command, resolve_instance,
+    save_config as write_config, select_best_java, validate_player_name,
+)
+
+CONFIG_DIR = Path(os.getenv("APPDATA", str(Path.home()))) / "DINGDINGLauncher"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+class TaskSignals(QObject):
+    finished = Signal(str, object)
+    failed = Signal(str, str)
+    log = Signal(str)
+    game_exited = Signal(int)
+    game_window_ready = Signal(int, bool)
 
-# =========================================================
-# Java
-# =========================================================
 
-def extract_natives(native_jars, natives_directory):
-
-    natives_directory = Path(
-        natives_directory
-    )
-
-    # 创建 natives 文件夹
-    natives_directory.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    # 清理旧的 DLL
-    for file in natives_directory.iterdir():
-
-        if file.is_file():
-
-            try:
-                file.unlink()
-            except:
-                pass
-
-    # 解压 Native JAR
-    for native_jar in native_jars:
-
-        try:
-
-            with zipfile.ZipFile(
-                native_jar,
-                "r"
-            ) as z:
-
-                for item in z.infolist():
-
-                    filename = item.filename
-
-                    # 只提取 Windows DLL
-                    if not filename.lower().endswith(
-                        ".dll"
-                    ):
-                        continue
-
-                    # 防止 JAR 内部目录结构导致 DLL
-                    # 被解压到子文件夹
-                    target = (
-                        natives_directory /
-                        Path(filename).name
-                    )
-
-                    with z.open(item) as source:
-
-                        with open(
-                            target,
-                            "wb"
-                        ) as target_file:
-
-                            shutil.copyfileobj(
-                                source,
-                                target_file
-                            )
-
-        except Exception as e:
-
-            print(
-                f"Native 解压失败：{native_jar}"
-            )
-
-            print(e)
-def get_java_version(java_path):
-    try:
-        result = subprocess.run(
-            [java_path, "-version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5
-        )
-
-        output = result.stderr.strip()
-
-        if not output:
-            output = result.stdout.strip()
-
-        if output:
-            return output.splitlines()[0]
-
-        return "无法获取版本"
-
-    except Exception as e:
-        return f"检测失败：{e}"
-
-
-def find_java():
-    java_paths = set()
-
-    # PATH 中的 Java
-    try:
-        result = subprocess.run(
-            ["where", "java"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        for line in result.stdout.splitlines():
-            line = line.strip()
-
-            if line and os.path.exists(line):
-                java_paths.add(Path(line))
-
-    except Exception:
-        pass
-
-    # 常见 Java 安装目录
-    search_dirs = [
-        Path("C:/Program Files/Java"),
-        Path("C:/Program Files/Eclipse Adoptium"),
-        Path("C:/Program Files/Microsoft"),
-        Path("C:/Program Files/Amazon Corretto"),
-        Path("C:/Program Files/Zulu"),
-        Path("C:/Program Files/BellSoft"),
-        Path("C:/Program Files/SapMachine"),
-        Path.home() / "AppData/Local/Programs",
-        Path.home() / "AppData/Roaming/.minecraft"
-    ]
-
-    for base_dir in search_dirs:
-
-        if not base_dir.exists():
-            continue
-
-        try:
-
-            for java_exe in base_dir.rglob("java.exe"):
-                java_paths.add(java_exe)
-
-        except Exception:
-            pass
-
-    return sorted(
-        java_paths,
-        key=lambda x: str(x).lower()
-    )
-
-
-# =========================================================
-# Minecraft 版本
-# =========================================================
-
-def find_minecraft_versions(minecraft_dir):
-
-    versions_dir = minecraft_dir / "versions"
-
-    if not versions_dir.exists():
-        return []
-
-    versions = []
-
-    try:
-
-        for item in versions_dir.iterdir():
-
-            if item.is_dir():
-                versions.append(item.name)
-
-    except Exception:
-        pass
-
-    return sorted(versions)
-
-
-# =========================================================
-# JSON
-# =========================================================
-
-def read_json_file(path):
-
-    try:
-
-        with open(
-            path,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return json.load(f)
-
-    except Exception:
-        return None
-
-
-def load_version_json(
-    minecraft_dir,
-    version
-):
-
-    version_dir = (
-        minecraft_dir /
-        "versions" /
-        version
-    )
-
-    json_file = (
-        version_dir /
-        f"{version}.json"
-    )
-
-    jar_file = (
-        version_dir /
-        f"{version}.jar"
-    )
-
-    if not json_file.exists():
-
-        return {
-            "success": False,
-            "error": "没有找到版本 JSON",
-            "json_file": json_file,
-            "jar_file": jar_file
-        }
-
-    data = read_json_file(json_file)
-
-    if data is None:
-
-        return {
-            "success": False,
-            "error": "JSON 文件读取失败",
-            "json_file": json_file,
-            "jar_file": jar_file
-        }
-
-    return {
-        "success": True,
-        "data": data,
-        "json_file": json_file,
-        "jar_file": jar_file
-    }
-
-
-# =========================================================
-# inheritsFrom
-# =========================================================
-
-def load_version_with_inheritance(
-    minecraft_dir,
-    version,
-    visited=None
-):
-
-    if visited is None:
-        visited = set()
-
-    if version in visited:
-        return None
-
-    visited.add(version)
-
-    result = load_version_json(
-        minecraft_dir,
-        version
-    )
-
-    if not result["success"]:
-        return None
-
-    data = result["data"]
-
-    parent_version = data.get(
-        "inheritsFrom"
-    )
-
-    if not parent_version:
-        return data
-
-    parent_data = load_version_with_inheritance(
-        minecraft_dir,
-        parent_version,
-        visited
-    )
-
-    if parent_data is None:
-        return data
-
-    # Libraries
-    parent_libraries = parent_data.get(
-        "libraries",
-        []
-    )
-
-    child_libraries = data.get(
-        "libraries",
-        []
-    )
-
-    data["libraries"] = (
-        parent_libraries +
-        child_libraries
-    )
-
-    # Arguments
-    parent_arguments = parent_data.get(
-        "arguments",
-        {}
-    )
-
-    child_arguments = data.get(
-        "arguments",
-        {}
-    )
-
-    merged_arguments = {}
-
-    for key in parent_arguments:
-
-        merged_arguments[key] = (
-            parent_arguments[key]
-        )
-
-    for key in child_arguments:
-
-        if key in merged_arguments:
-
-            if (
-                isinstance(
-                    merged_arguments[key],
-                    list
-                )
-                and
-                isinstance(
-                    child_arguments[key],
-                    list
-                )
-            ):
-
-                merged_arguments[key] = (
-                    merged_arguments[key]
-                    +
-                    child_arguments[key]
-                )
-
-            else:
-
-                merged_arguments[key] = (
-                    child_arguments[key]
-                )
-
-        else:
-
-            merged_arguments[key] = (
-                child_arguments[key]
-            )
-
-    data["arguments"] = merged_arguments
-
-    # mainClass
-    if (
-        "mainClass" not in data
-        and
-        "mainClass" in parent_data
-    ):
-
-        data["mainClass"] = (
-            parent_data["mainClass"]
-        )
-
-    # assets
-    if (
-        "assets" not in data
-        and
-        "assets" in parent_data
-    ):
-
-        data["assets"] = (
-            parent_data["assets"]
-        )
-
-    return data
-
-
-# =========================================================
-# Library rules
-# =========================================================
-
-def library_allowed(library):
-
-    rules = library.get("rules")
-
-    if not rules:
-        return True
-
-    allowed = False
-
-    for rule in rules:
-
-        os_rule = rule.get("os")
-
-        # 没有 OS 限制
-        if not os_rule:
-
-            if rule.get("action") == "allow":
-                allowed = True
-
-            elif rule.get("action") == "disallow":
-                allowed = False
-
-            continue
-
-        os_name = os_rule.get("name")
-
-        # Windows
-        if os_name == CURRENT_OS:
-
-            if rule.get("action") == "allow":
-                allowed = True
-
-            elif rule.get("action") == "disallow":
-                allowed = False
-
-    return allowed
-
-
-# =========================================================
-# Maven 路径
-# =========================================================
-
-def library_name_to_path(
-    library_name
-):
-
-    parts = library_name.split(":")
-
-    if len(parts) < 3:
-        return None
-
-    group = parts[0]
-    artifact = parts[1]
-    version = parts[2]
-
-    classifier = None
-    extension = "jar"
-
-    if len(parts) >= 4:
-        classifier = parts[3]
-
-    if "@" in version:
-
-        version, extension = (
-            version.split("@", 1)
-        )
-
-    group_path = group.replace(
-        ".",
-        "/"
-    )
-
-    filename = (
-        artifact +
-        "-" +
-        version
-    )
-
-    if classifier:
-
-        filename += (
-            "-" +
-            classifier
-        )
-
-    filename += "." + extension
-
-    return (
-        Path(group_path) /
-        artifact /
-        version /
-        filename
-    )
-
-
-# =========================================================
-# 获取 Libraries
-# =========================================================
-
-def get_library_jars(
-    minecraft_dir,
-    data
-):
-
-    libraries = data.get(
-        "libraries",
-        []
-    )
-
-    library_dir = (
-        minecraft_dir /
-        "libraries"
-    )
-
-    normal_jars = []
-    native_libraries = []
-    missing_libraries = []
-    skipped_libraries = []
-
-    for library in libraries:
-
-        name = library.get(
-            "name",
-            "未知 Library"
-        )
-
-        if not library_allowed(library):
-
-            skipped_libraries.append(name)
-
-            continue
-
-        downloads = library.get(
-            "downloads",
-            {}
-        )
-
-        artifact = downloads.get(
-            "artifact"
-        )
-
-        # 普通 JAR
-        if artifact:
-
-            relative_path = artifact.get(
-                "path"
-            )
-
-            if relative_path:
-
-                jar_path = (
-                    library_dir /
-                    relative_path
-                )
-
-                if jar_path.exists():
-
-                    normal_jars.append(
-                        jar_path
-                    )
-
-                else:
-
-                    missing_libraries.append(
-                        (
-                            name,
-                            jar_path
-                        )
-                    )
-
-        else:
-
-            relative_path = (
-                library_name_to_path(
-                    name
-                )
-            )
-
-            if relative_path:
-
-                jar_path = (
-                    library_dir /
-                    relative_path
-                )
-
-                if jar_path.exists():
-
-                    normal_jars.append(
-                        jar_path
-                    )
-
-                else:
-
-                    missing_libraries.append(
-                        (
-                            name,
-                            jar_path
-                        )
-                    )
-
-        # Windows Native
-        classifiers = downloads.get(
-            "classifiers",
-            {}
-        )
-
-        native_info = classifiers.get(
-            "natives-windows"
-        )
-
-        if native_info:
-
-            native_path = native_info.get(
-                "path"
-            )
-
-            if native_path:
-
-                native_jar = (
-                    library_dir /
-                    native_path
-                )
-
-                if native_jar.exists():
-
-                    native_libraries.append(
-                        native_jar
-                    )
-
-                else:
-
-                    missing_libraries.append(
-                        (
-                            f"{name} (native)",
-                            native_jar
-                        )
-                    )
-
-    return {
-        "normal": normal_jars,
-        "native": native_libraries,
-        "skipped": skipped_libraries,
-        "missing": missing_libraries
-    }
-
-
-# =========================================================
-# 参数处理
-# =========================================================
-
-def flatten_argument(
-    argument
-):
-
-    if isinstance(argument, str):
-        return [argument]
-
-    if isinstance(argument, dict):
-
-        value = argument.get(
-            "value"
-        )
-
-        if isinstance(value, list):
-            return value
-
-        return [value]
-
-    return []
-
-
-def get_game_arguments(data):
-
-    result = []
-
-    arguments = data.get(
-        "arguments"
-    )
-
-    if arguments:
-
-        game_arguments = arguments.get(
-            "game",
-            []
-        )
-
-        for arg in game_arguments:
-
-            # 普通字符串
-            if isinstance(arg, str):
-
-                # 暂时过滤 Quick Play
-                # 我们目前做的是普通启动，
-                # 不需要 Quick Play
-                if arg.startswith("--quickPlay"):
-                    continue
-
-                if "${quickPlay" in arg:
-                    continue
-
-                result.append(arg)
-
-            # 字典形式
-            elif isinstance(arg, dict):
-
-                value = arg.get(
-                    "value"
-                )
-
-                if isinstance(value, str):
-
-                    if (
-                        value.startswith(
-                            "--quickPlay"
-                        )
-                    ):
-                        continue
-
-                    if (
-                        "${quickPlay" in value
-                    ):
-                        continue
-
-                    result.append(value)
-
-                elif isinstance(value, list):
-
-                    for item in value:
-
-                        if not isinstance(
-                            item,
-                            str
-                        ):
-                            continue
-
-                        if item.startswith(
-                            "--quickPlay"
-                        ):
-                            continue
-
-                        if "${quickPlay" in item:
-                            continue
-
-                        result.append(item)
-
-        return result
-
-    # 老版本 Minecraft
-    old_arguments = data.get(
-        "minecraftArguments"
-    )
-
-    if old_arguments:
-
-        return old_arguments.split()
-
-    return []
-
-
-def get_jvm_arguments(data):
-
-    result = []
-
-    arguments = data.get(
-        "arguments"
-    )
-
-    if not arguments:
-        return result
-
-    jvm_arguments = arguments.get(
-        "jvm",
-        []
-    )
-
-    for arg in jvm_arguments:
-
-        # 普通字符串参数
-        if isinstance(arg, str):
-
-            result.append(arg)
-
-        # 带 rules 的参数
-        elif isinstance(arg, dict):
-
-            rules = arg.get("rules")
-
-            # 没有 rules，直接使用
-            if not rules:
-
-                value = arg.get("value")
-
-                if isinstance(value, list):
-                    result.extend(value)
-                elif value:
-                    result.append(value)
-
-                continue
-
-            # 判断当前 Windows 是否允许
-            allowed = False
-
-            for rule in rules:
-
-                os_rule = rule.get("os")
-
-                # 没有 OS 限制
-                if not os_rule:
-
-                    if rule.get("action") == "allow":
-                        allowed = True
-
-                    elif rule.get("action") == "disallow":
-                        allowed = False
-
-                    continue
-
-                os_name = os_rule.get("name")
-
-                # 当前系统是 Windows
-                if os_name == "windows":
-
-                    if rule.get("action") == "allow":
-                        allowed = True
-
-                    elif rule.get("action") == "disallow":
-                        allowed = False
-
-            if not allowed:
-                continue
-
-            value = arg.get("value")
-
-            if isinstance(value, list):
-                result.extend(value)
-
-            elif value:
-                result.append(value)
-
-    return result
-
-
-# =========================================================
-# 参数变量替换
-# =========================================================
-
-def replace_placeholders(
-    value,
-    variables
-):
-
-    if not isinstance(value, str):
-        return value
-
-    for key, replacement in variables.items():
-
-        value = value.replace(
-            "${" + key + "}",
-            str(replacement)
-        )
-
-    return value
-
-
-# =========================================================
-# 主窗口
-# =========================================================
-class LogEmitter(QObject):
-    log_signal = Signal(str)
-CLIENT_ID = ""
-
-AUTHORITY = "https://login.microsoftonline.com/consumers"
-
-REDIRECT_URI = "http://localhost"
-
-SCOPES = [
-    "XboxLive.signin",
-    "XboxLive.offline_access"
-]
 class LauncherWindow(QWidget):
-
     def __init__(self):
-
         super().__init__()
-        self.log_emitter = LogEmitter()
-        self.log_emitter.log_signal.connect(self.append_log)
-        self.setWindowTitle(
-            "我的 Minecraft 启动器"
-        )
-
-        self.resize(
-            1000,
-            850
-        )
-
-        self.minecraft_dir = (
-            Path(
-                os.environ.get(
-                    "APPDATA",
-                    ""
-                )
-            )
-            /
-            ".minecraft"
-        )
-
-        self.java_paths = []
-
-        self.current_version = None
-
-        self.current_json = None
-
+        self.config = read_config(CONFIG_FILE)
+        default_dir = Path(os.getenv("APPDATA", str(Path.home()))) / ".minecraft"
+        self.minecraft_dir = Path(self.config["minecraft_dir"] or default_dir).resolve()
+        self.account_type = self.config["account_type"]
+        self.microsoft_account = None
+        self.java_infos = []
+        self._preferred_java_path = self.config["java_path"]
+        self.current_spec = None
+        self.current_game_directory = self.minecraft_dir
+        self.current_instance = None
+        self._scanned_versions, self._scanned_instances = [], []
+        self.game_process = None
+        self._running_version = None
+        self._game_thread = None
+        self._game_log_lines = deque(maxlen=5000)
+        self._game_log_lock = threading.Lock()
+        self._jobs = {}
+        self._selection_revision = 0
+        self._closing = False
+        self._initializing = True
+        self.signals = TaskSignals(self)
+        self.signals.finished.connect(self._job_finished)
+        self.signals.failed.connect(self._job_failed)
+        self.signals.log.connect(self.append_log)
+        self.signals.game_exited.connect(self._game_exited)
+        self.signals.game_window_ready.connect(self._game_window_ready)
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(400)
+        self.save_timer.timeout.connect(self.save_config)
+        self.setWindowTitle("DINGDING Minecraft Launcher")
+        self.resize(1000, 900)
         self.init_ui()
-
+        self.log_timer = QTimer(self)
+        self.log_timer.setInterval(100)
+        self.log_timer.timeout.connect(self._flush_game_log)
+        self.log_timer.start()
+        self._initializing = False
         self.scan_java()
-
-        if self.minecraft_dir.exists():
-
-            self.scan_versions()
-
-
-    # =====================================================
-    # UI
-    # =====================================================
-    def append_log(self, text):
-        self.log_text.append(text)
-    def init_ui(self):
-
-        layout = QVBoxLayout()
-
-        # 标题
-        title = QLabel(
-            "Minecraft Java 启动器"
-        )
-
-        title.setStyleSheet(
-            "font-size: 24px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(title)
-
-        # Java
-        java_title = QLabel(
-            "Java 环境"
-        )
-
-        java_title.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(java_title)
-
-        self.java_status = QLabel(
-            "正在检测 Java..."
-        )
-
-        layout.addWidget(
-            self.java_status
-        )
-
-        java_layout = QHBoxLayout()
-
-        self.java_combo = QComboBox()
-
-        java_layout.addWidget(
-            self.java_combo
-        )
-
-        java_button = QPushButton(
-            "扫描 Java"
-        )
-
-        java_button.clicked.connect(
-            self.scan_java
-        )
-
-        java_layout.addWidget(
-            java_button
-        )
-
-        layout.addLayout(
-            java_layout
-        )
-
-        # Minecraft 目录
-        mc_title = QLabel(
-            "Minecraft 游戏目录"
-        )
-
-        mc_title.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            mc_title
-        )
-
-        self.minecraft_path_label = QLabel(
-            str(self.minecraft_dir)
-        )
-
-        layout.addWidget(
-            self.minecraft_path_label
-        )
-
-        path_button = QPushButton(
-            "选择游戏目录"
-        )
-
-        path_button.clicked.connect(
-            self.choose_minecraft_directory
-        )
-
-        layout.addWidget(
-            path_button
-        )
-
-        # 版本
-        version_title = QLabel(
-            "Minecraft 版本"
-        )
-
-        version_title.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            version_title
-        )
-
-        version_layout = QHBoxLayout()
-
-        self.version_combo = QComboBox()
-
-        self.version_combo.currentTextChanged.connect(
-            self.version_selected
-        )
-
-        version_layout.addWidget(
-            self.version_combo
-        )
-
-        scan_button = QPushButton(
-            "扫描版本"
-        )
-
-        scan_button.clicked.connect(
-            self.scan_versions
-        )
-
-        version_layout.addWidget(
-            scan_button
-        )
-
-        layout.addLayout(
-            version_layout
-        )
-
-        # 玩家名称
-        player_layout = QHBoxLayout()
-
-        player_layout.addWidget(
-            QLabel("游戏昵称：")
-        )
-
-        self.player_name = QLineEdit()
-
-        self.player_name.setText(
-            "Steve"
-        )
-
-        player_layout.addWidget(
-            self.player_name
-        )
-
-        layout.addLayout(
-            player_layout
-        )
-
-        # 内存
-        memory_layout = QHBoxLayout()
-
-        memory_layout.addWidget(
-            QLabel("最大内存：")
-        )
-
-        self.memory_spin = QSpinBox()
-
-        self.memory_spin.setRange(
-            512,
-            32768
-        )
-
-        self.memory_spin.setValue(
-            4096
-        )
-
-        self.memory_spin.setSuffix(
-            " MB"
-        )
-
-        memory_layout.addWidget(
-            self.memory_spin
-        )
-
-        layout.addLayout(
-            memory_layout
-        )
-
-        # 状态
-        self.version_status = QLabel(
-            "请选择 Minecraft 版本"
-        )
-
-        layout.addWidget(
-            self.version_status
-        )
-
-        # 启动按钮
-        self.launch_button = QPushButton(
-            "启动 Minecraft"
-        )
-        self.login_button = QPushButton("登录 Microsoft")
-        self.login_button.clicked.connect(self.login_microsoft)
-
-        self.launch_button.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-            "padding: 10px;"
-        )
-
-        self.launch_button.clicked.connect(
-            self.launch_minecraft
-        )
-        layout.addWidget(self.login_button)
-        layout.addWidget(self.launch_button)
-
-
-        # 版本信息
-        info_title = QLabel(
-            "版本信息"
-        )
-
-        info_title.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            info_title
-        )
-
-        self.info_text = QTextEdit()
-
-        self.info_text.setReadOnly(
-            True
-        )
-
-        layout.addWidget(
-            self.info_text
-        )
-
-        # 启动日志
-        log_title = QLabel(
-            "启动日志"
-        )
-
-        log_title.setStyleSheet(
-            "font-size: 18px;"
-            "font-weight: bold;"
-        )
-
-        layout.addWidget(
-            log_title
-        )
-
-        self.log_text = QTextEdit()
-
-        self.log_text.setReadOnly(
-            True
-        )
-
-        layout.addWidget(
-            self.log_text
-        )
-
-        self.setLayout(
-            layout
-        )
-
-
-    # =====================================================
-    # Java 扫描
-    # =====================================================
-
-    def scan_java(self):
-
-        self.java_combo.clear()
-
-        self.java_paths = find_java()
-
-        if not self.java_paths:
-
-            self.java_status.setText(
-                "没有找到 Java"
-            )
-
-            return
-
-        self.java_status.setText(
-            f"找到 {len(self.java_paths)} 个 Java"
-        )
-
-        for java_path in self.java_paths:
-
-            version = get_java_version(
-                str(java_path)
-            )
-
-            text = (
-                f"{version} | "
-                f"{java_path}"
-            )
-
-            self.java_combo.addItem(
-                text,
-                str(java_path)
-            )
-
-
-    # =====================================================
-    # Minecraft 目录
-    # =====================================================
-
-    def choose_minecraft_directory(self):
-
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "选择 Minecraft 游戏目录"
-        )
-
-        if not directory:
-            return
-
-        self.minecraft_dir = Path(
-            directory
-        )
-
-        self.minecraft_path_label.setText(
-            str(self.minecraft_dir)
-        )
-
         self.scan_versions()
 
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("DINGDING Minecraft Launcher")
+        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        layout.addWidget(title)
 
-    # =====================================================
-    # 扫描版本
-    # =====================================================
+        layout.addWidget(QLabel("Java 环境"))
+        self.java_status = QLabel("正在检测 Java…")
+        layout.addWidget(self.java_status)
+        java_row = QHBoxLayout()
+        self.java_combo = QComboBox()
+        self.java_combo.setMinimumWidth(300)
+        self.java_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.java_combo.currentIndexChanged.connect(self.java_selection_changed)
+        self.java_combo.activated.connect(self._manual_java_selected)
+        java_row.addWidget(self.java_combo, 1)
+        self.java_scan_button = QPushButton("扫描 Java")
+        self.java_scan_button.clicked.connect(self.scan_java)
+        java_row.addWidget(self.java_scan_button)
+        self.java_auto_check = QCheckBox("自动匹配")
+        self.java_auto_check.setChecked(self.config["java_auto"])
+        self.java_auto_check.setToolTip("切换游戏版本时重新匹配 Java；手动选择会关闭自动匹配。")
+        self.java_auto_check.toggled.connect(self._java_auto_changed)
+        java_row.addWidget(self.java_auto_check)
+        self.java_browse_button = QPushButton("手动选择")
+        self.java_browse_button.clicked.connect(self.choose_java)
+        java_row.addWidget(self.java_browse_button)
+        layout.addLayout(java_row)
+
+        layout.addWidget(QLabel("Minecraft 游戏目录"))
+        directory_row = QHBoxLayout()
+        self.minecraft_path_label = QLabel(str(self.minecraft_dir))
+        self.minecraft_path_label.setWordWrap(True)
+        directory_row.addWidget(self.minecraft_path_label, 1)
+        self.directory_button = QPushButton("选择游戏目录")
+        self.directory_button.clicked.connect(self.choose_minecraft_directory)
+        directory_row.addWidget(self.directory_button)
+        layout.addLayout(directory_row)
+
+        layout.addWidget(QLabel("Minecraft 版本 / 本地整合包"))
+        version_row = QHBoxLayout()
+        self.version_combo = QComboBox()
+        self.version_combo.currentIndexChanged.connect(self.version_selected)
+        version_row.addWidget(self.version_combo, 1)
+        self.version_scan_button = QPushButton("扫描版本")
+        self.version_scan_button.clicked.connect(self.scan_versions)
+        version_row.addWidget(self.version_scan_button)
+        self.modpack_button = QPushButton("添加本地整合包")
+        self.modpack_button.setToolTip("选择已解压且已安装游戏文件的整合包目录；直接使用原有 Mod、配置与存档。")
+        self.modpack_button.clicked.connect(self.choose_modpack_directory)
+        version_row.addWidget(self.modpack_button)
+        layout.addLayout(version_row)
+
+        account_row = QHBoxLayout()
+        account_row.addWidget(QLabel("账户类型："))
+        self.account_combo = QComboBox()
+        self.account_combo.addItem("离线账户", "offline")
+        self.account_combo.addItem("Microsoft 账户", "microsoft")
+        self.account_combo.setCurrentIndex(self.account_combo.findData(self.account_type))
+        account_row.addWidget(self.account_combo)
+        account_row.addWidget(QLabel("游戏昵称："))
+        self.player_name = QLineEdit(self.config["offline_name"])
+        self.player_name.setMaxLength(16)
+        self.player_name.textEdited.connect(self.offline_name_changed)
+        account_row.addWidget(self.player_name, 1)
+        self.login_button = QPushButton("登录 Microsoft")
+        self.login_button.clicked.connect(self.login_microsoft)
+        account_row.addWidget(self.login_button)
+        layout.addLayout(account_row)
+        self.account_combo.currentIndexChanged.connect(self.account_type_changed)
+
+        settings_row = QHBoxLayout()
+        settings_row.addWidget(QLabel("最大内存："))
+        self.memory_spin = QSpinBox()
+        self.memory_spin.setRange(512, 32768)
+        self.memory_spin.setSingleStep(512)
+        self.memory_spin.setSuffix(" MB")
+        self.memory_spin.setValue(self.config["memory"])
+        self.memory_spin.valueChanged.connect(lambda value: self._setting_changed("memory", value))
+        settings_row.addWidget(self.memory_spin)
+        settings_row.addWidget(QLabel("窗口："))
+        self.width_spin = QSpinBox()
+        self.width_spin.setRange(320, 7680)
+        self.width_spin.setValue(self.config["game_width"])
+        self.width_spin.valueChanged.connect(lambda value: self._setting_changed("game_width", value))
+        settings_row.addWidget(self.width_spin)
+        settings_row.addWidget(QLabel("×"))
+        self.height_spin = QSpinBox()
+        self.height_spin.setRange(240, 4320)
+        self.height_spin.setValue(self.config["game_height"])
+        self.height_spin.valueChanged.connect(lambda value: self._setting_changed("game_height", value))
+        settings_row.addWidget(self.height_spin)
+        self.fullscreen_check = QCheckBox("全屏")
+        self.fullscreen_check.setToolTip("Windows 使用无边框全屏，不切换桌面分辨率和刷新率；其他系统使用游戏原生全屏。")
+        self.fullscreen_check.setChecked(self.config["fullscreen"])
+        self.fullscreen_check.toggled.connect(self._fullscreen_changed)
+        settings_row.addWidget(self.fullscreen_check)
+        layout.addLayout(settings_row)
+
+        self.version_status = QLabel("正在扫描本地版本…")
+        self.version_status.setWordWrap(True)
+        layout.addWidget(self.version_status)
+        self.launch_button = QPushButton("启动 Minecraft")
+        self.launch_button.setStyleSheet("font-size: 18px; font-weight: bold; padding: 10px;")
+        self.launch_button.clicked.connect(self.launch_minecraft)
+        layout.addWidget(self.launch_button)
+        layout.addWidget(QLabel("版本信息"))
+        self.info_text = QTextEdit()
+        self.info_text.setReadOnly(True)
+        layout.addWidget(self.info_text, 1)
+        layout.addWidget(QLabel("启动日志"))
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setUndoRedoEnabled(False)
+        self.log_text.document().setMaximumBlockCount(5000)
+        layout.addWidget(self.log_text, 2)
+        self.account_type_changed(self.account_combo.currentIndex())
+        self._fullscreen_changed(self.config["fullscreen"])
+
+    def _run_job(self, name, operation, on_success):
+        if name in self._jobs or self._closing:
+            return False
+        self._jobs[name] = on_success
+        self._update_actions()
+
+        def run():
+            try:
+                result = operation()
+            except Exception as exc:
+                if not self._closing:
+                    self.signals.failed.emit(name, str(exc))
+            else:
+                if not self._closing:
+                    self.signals.finished.emit(name, result)
+
+        threading.Thread(target=run, name=f"launcher-{name}", daemon=True).start()
+        return True
+
+    def _job_finished(self, name, result):
+        callback = self._jobs.pop(name, None)
+        if callback and not self._closing:
+            try:
+                callback(result)
+            except Exception as exc:
+                self.append_log(f"处理结果失败：{exc}")
+                self.version_status.setText(str(exc))
+        self._update_actions()
+
+    def _job_failed(self, name, error):
+        self._jobs.pop(name, None)
+        self.append_log(error)
+        if name.startswith("selection-"):
+            if name == f"selection-{self._selection_revision}":
+                self.version_status.setText(error)
+        elif name == "java":
+            self.java_status.setText("Java 扫描失败，可尝试手动选择。")
+        elif name == "launch":
+            QMessageBox.warning(self, "无法启动", error)
+            self.version_status.setText("启动准备失败，请查看日志。")
+        elif name == "login":
+            QMessageBox.warning(self, "登录未完成", error)
+        elif name == "modpack":
+            QMessageBox.warning(self, "无法添加整合包", error)
+        else:
+            self.version_status.setText(error)
+        self._update_actions()
+
+    def _update_actions(self):
+        if not hasattr(self, "launch_button"):
+            return
+        running = self.game_process is not None
+        preparing = "launch" in self._jobs
+        self.java_scan_button.setEnabled("java" not in self._jobs and not preparing)
+        self.java_browse_button.setEnabled("java" not in self._jobs and not preparing)
+        self.java_combo.setEnabled(not preparing)
+        self.java_auto_check.setEnabled(not preparing)
+        pack_busy = "modpack" in self._jobs
+        self.version_scan_button.setEnabled("versions" not in self._jobs and not preparing and not pack_busy)
+        self.directory_button.setEnabled(not preparing and "versions" not in self._jobs and "java" not in self._jobs and not pack_busy)
+        self.version_combo.setEnabled("versions" not in self._jobs and not preparing and not pack_busy)
+        self.modpack_button.setEnabled(not preparing and not running and not pack_busy and "versions" not in self._jobs)
+        self.account_combo.setEnabled("login" not in self._jobs and not preparing)
+        self.player_name.setEnabled(self.account_type == "offline" and not preparing)
+        self.login_button.setEnabled(self.account_type == "microsoft" and "login" not in self._jobs and not preparing)
+        self.launch_button.setEnabled(bool(self.current_spec) and self.java_combo.currentIndex() >= 0
+                                      and not preparing and not running and "login" not in self._jobs
+                                      and "java" not in self._jobs and "versions" not in self._jobs and not pack_busy)
+        self.launch_button.setText("Minecraft 正在运行" if running else "正在准备启动…" if preparing else "启动 Minecraft")
+        self.login_button.setText("正在登录…" if "login" in self._jobs else
+                                  f"已登录：{self.microsoft_account.name}" if self.microsoft_account else "登录 Microsoft")
+
+    def _schedule_save(self):
+        if not self._initializing:
+            self.save_timer.start()
+
+    def save_config(self):
+        self.save_timer.stop()
+        try:
+            write_config(self.config, CONFIG_FILE)
+        except OSError as exc:
+            self.append_log(f"配置保存失败：{exc}")
+            return False
+        return True
+
+    def _setting_changed(self, key, value):
+        self.config[key] = value
+        if key == "memory" and not self._initializing:
+            self.auto_select_java()
+        self._schedule_save()
+
+    def _fullscreen_changed(self, checked):
+        self.width_spin.setEnabled(not checked)
+        self.height_spin.setEnabled(not checked)
+        self._setting_changed("fullscreen", checked)
+
+    def java_selection_changed(self, index):
+        info = self.java_combo.itemData(index)
+        if not isinstance(info, JavaInfo):
+            return
+        self.config["java_path"] = str(info.path)
+        self.java_status.setText(f"当前 Java {info.major}（{info.architecture or '架构未知'}）")
+        self.java_combo.setToolTip(str(info.path))
+        self._schedule_save()
+        self._update_actions()
+
+    def _manual_java_selected(self, index):
+        info = self.java_combo.itemData(index)
+        if isinstance(info, JavaInfo):
+            self._preferred_java_path = str(info.path)
+            self.java_auto_check.setChecked(False)
+
+    def _java_auto_changed(self, enabled):
+        self.config["java_auto"] = enabled
+        self._schedule_save()
+        if enabled:
+            self.auto_select_java()
+
+    def offline_name_changed(self, text):
+        if self.account_type != "offline":
+            return
+        try:
+            name = validate_player_name(text)
+        except LauncherError as exc:
+            self.player_name.setToolTip(str(exc))
+            self.player_name.setStyleSheet("border: 1px solid #c33;")
+            return
+        self.player_name.setStyleSheet("")
+        self.player_name.setToolTip(f"离线 UUID：{get_offline_uuid(name)}")
+        self.config["offline_name"] = name
+        self.config["selected_account"] = get_offline_uuid(name)
+        self._schedule_save()
+
+    def account_type_changed(self, index):
+        self.account_type = self.account_combo.itemData(index) or "offline"
+        self.config["account_type"] = self.account_type
+        if self.account_type == "offline":
+            self.player_name.setText(self.config["offline_name"])
+            self.player_name.setStyleSheet("")
+            self.config["selected_account"] = get_offline_uuid(self.config["offline_name"])
+        else:
+            self.player_name.setText(self.microsoft_account.name if self.microsoft_account else "尚未登录")
+            self.player_name.setStyleSheet("")
+            self.config["selected_account"] = self.microsoft_account.uuid if self.microsoft_account else ""
+        self._schedule_save()
+        self._update_actions()
+
+    def append_log(self, text):
+        if self._closing:
+            return
+        text = str(text)
+        if self.microsoft_account:
+            text = text.replace(self.microsoft_account.access_token, "<已隐藏>")
+        scrollbar = self.log_text.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        cursor = QTextCursor(self.log_text.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text + "\n")
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def scan_java(self):
+        saved, root = self.config["java_path"], self.minecraft_dir
+        self.java_status.setText("正在扫描 Java，可继续操作…")
+        self._run_job("java", lambda: find_java(root, saved), self._java_scanned)
+
+    def _java_scanned(self, infos):
+        self.java_infos = infos
+        saved = self._preferred_java_path
+        self.java_combo.blockSignals(True)
+        self.java_combo.clear()
+        for info in infos:
+            self.java_combo.addItem(f"Java {info.major} / {info.architecture or '?'} | {info.path}", info)
+        saved_index = next((i for i, info in enumerate(infos)
+                            if os.path.normcase(str(info.path)) == os.path.normcase(saved)), -1)
+        if saved_index >= 0:
+            self.java_combo.setCurrentIndex(saved_index)
+        self.java_combo.blockSignals(False)
+        if infos:
+            self.java_selection_changed(self.java_combo.currentIndex())
+            self.auto_select_java()
+        else:
+            self.java_status.setText("没有找到可用 Java，请手动选择或先安装 Java。")
+        self.append_log(f"Java 扫描完成：找到 {len(infos)} 个可用环境。")
+
+    def choose_java(self):
+        path, _ = QFileDialog.getOpenFileName(self, "选择 Java 可执行文件", "", "Java (java.exe java);;所有文件 (*)")
+        if path:
+            self._run_job("java", lambda: inspect_java(Path(path)), self._java_added)
+
+    def _java_added(self, info):
+        infos = [item for item in self.java_infos if item.path != info.path] + [info]
+        self.config["java_path"] = str(info.path)
+        self._preferred_java_path = str(info.path)
+        self.java_auto_check.setChecked(False)
+        self._java_scanned(infos)
+
+    def auto_select_java(self):
+        if not self.current_spec:
+            return
+        required = get_required_java_version(self.current_spec.name, self.current_spec.data)
+        current = self.java_combo.currentData()
+        if not self.config["java_auto"]:
+            if current and required and current.major != required:
+                self.java_status.setText(f"手动选择 Java {current.major}；当前游戏建议 Java {required}。")
+            return
+        if required is None:
+            self.java_status.setText("无法判断该游戏所需 Java，请取消自动匹配后手动选择。")
+            self.java_combo.setCurrentIndex(-1)
+            self._update_actions()
+            return
+        chosen = select_best_java(self.java_infos, required, self.config["memory"], self._preferred_java_path)
+        if chosen:
+            self.java_combo.setCurrentIndex(self.java_infos.index(chosen))
+            suffix = "" if chosen.major == required else "；高于建议版本，如不兼容请安装匹配版本"
+            self.java_status.setText(f"已自动选择 Java {chosen.major}{suffix}")
+        elif required:
+            self.java_combo.setCurrentIndex(-1)
+            self.java_status.setText(f"未找到满足版本、架构与内存要求的 Java {required}+，请扫描或安装。")
+            self._update_actions()
+
+    def choose_minecraft_directory(self):
+        directory = QFileDialog.getExistingDirectory(self, "选择 Minecraft 游戏目录", str(self.minecraft_dir))
+        if not directory:
+            return
+        self.minecraft_dir = Path(directory).resolve()
+        self._selection_revision += 1
+        self.current_spec = None
+        self.minecraft_path_label.setText(str(self.minecraft_dir))
+        self.config["minecraft_dir"] = str(self.minecraft_dir)
+        self.config["selected_version"] = ""
+        self.config["selected_modpack"] = ""
+        self._schedule_save()
+        self.scan_versions()
+        self.scan_java()
 
     def scan_versions(self):
+        if "versions" in self._jobs:
+            return
+        root = self.minecraft_dir
+        self.current_spec = None
+        self._selection_revision += 1
+        self.version_status.setText("正在扫描本地版本…")
+        packs, selected_pack = list(self.config["local_modpacks"]), self.config["selected_modpack"]
 
+        def scan():
+            versions, instances = find_minecraft_versions(root), find_modpack_instances(root)
+            entries = build_version_entries(root, versions, instances, packs, selected_pack)
+            return versions, instances, entries
+
+        self._run_job("versions", scan, self._versions_scanned)
+
+    def _versions_scanned(self, result):
+        versions, instances, entries = result
+        self._scanned_versions, self._scanned_instances = versions, instances
+        saved = self.config["selected_version"]
+        saved_pack = self.config["selected_modpack"]
+        self.version_combo.blockSignals(True)
         self.version_combo.clear()
-
-        versions = find_minecraft_versions(
-            self.minecraft_dir
-        )
-
-        if not versions:
-
-            self.version_status.setText(
-                "没有找到 Minecraft 版本"
-            )
-
-            return
-
-        self.version_combo.addItems(
-            versions
-        )
-
-        self.version_status.setText(
-            f"找到 {len(versions)} 个版本"
-        )
-
-        self.version_selected(
-            versions[0]
-        )
-
-
-    # =====================================================
-    # 版本选择
-    # =====================================================
-
-    def version_selected(
-        self,
-        version
-    ):
-
-        if not version:
-            return
-
-        self.current_version = version
-
-        data = load_version_with_inheritance(
-            self.minecraft_dir,
-            version
-        )
-
-        if data is None:
-
-            self.version_status.setText(
-                "JSON 读取失败"
-            )
-
+        previous_category = None
+        for entry in entries:
+            item = entry["data"]
+            if previous_category is not None and item["category"] != previous_category:
+                self.version_combo.insertSeparator(self.version_combo.count())
+            previous_category = item["category"]
+            self.version_combo.addItem(entry["label"], item)
+            self.version_combo.setItemData(self.version_combo.count() - 1,
+                f"类型：{VERSION_TYPE_LABELS[item['category']]}\n游戏目录：{entry['game_dir']}", Qt.ItemDataRole.ToolTipRole)
+        index = next((i for i in range(self.version_combo.count())
+                      if isinstance(self.version_combo.itemData(i), dict)
+                      and self.version_combo.itemData(i).get("type") == "local_modpack"
+                      and os.path.normcase(self.version_combo.itemData(i)["path"]) == os.path.normcase(saved_pack)), -1) if saved_pack else self.version_combo.findText(saved)
+        if index < 0 and not saved_pack:
+            migrated = next((entry for entry in entries if saved in entry["aliases"]), None)
+            if migrated:
+                index = self.version_combo.findText(migrated["label"])
+        self.version_combo.setCurrentIndex(index if index >= 0 else 0 if self.version_combo.count() else -1)
+        self.version_combo.blockSignals(False)
+        if self.version_combo.currentIndex() >= 0:
+            self.version_selected(self.version_combo.currentIndex())
+        else:
             self.info_text.clear()
+            self.version_status.setText("没有找到已安装版本，请选择包含 versions 的游戏目录。")
 
-            self.current_json = None
-
+    def version_selected(self, index):
+        item = self.version_combo.itemData(index)
+        if not isinstance(item, dict):
+            self.current_spec = None
+            self._update_actions()
             return
+        self.current_spec = None
+        self._selection_revision += 1
+        revision = self._selection_revision
+        root, name = self.minecraft_dir, item["name"]
+        self.current_instance = item.get("path", name) if item["type"] != "version" else None
+        self.config["selected_version"] = self.version_combo.currentText()
+        self.config["selected_modpack"] = item.get("path", "")
+        self._schedule_save()
+        self.version_status.setText("正在检查版本和依赖…")
+        self.info_text.clear()
 
-        self.current_json = data
+        def prepare():
+            if item["type"] == "local_modpack":
+                spec, directory = resolve_local_modpack(Path(item["path"]), root, item["version"])
+            elif item["type"] == "modpack":
+                spec, directory = resolve_instance(root, name)
+            else:
+                spec, directory = load_version(root, name), root
+                isolated = spec.json_path.parent
+                if any((isolated / marker).is_dir() for marker in ("mods", "config", "saves")):
+                    # Existing installed packs also appear in the normal version
+                    # list. Honor their isolation instead of using root/mods.
+                    spec, directory = resolve_local_modpack(isolated, root, name)
+            return spec, directory, get_library_jars(spec), detect_version_type(spec, directory, item["type"] != "version")
 
-        version_dir = (
-            self.minecraft_dir /
-            "versions" /
-            version
-        )
+        def selected(result):
+            if revision != self._selection_revision:
+                return
+            spec, directory, libraries, category = result
+            self.current_spec, self.current_game_directory = spec, directory
+            required = get_required_java_version(spec.name, spec.data)
+            self.info_text.setPlainText(
+                f"类型：{VERSION_TYPE_LABELS[category]}\n游戏版本：{spec.name}\n游戏目录：{directory}\n\nJSON：{spec.json_path}\n"
+                f"游戏 JAR：{spec.jar_path}\n主类：{spec.data.get('mainClass', '未提供')}\n"
+                f"建议 Java：{required or '无法判断，请手动选择'}\n\n"
+                f"普通 JAR：{len(libraries['normal'])}  Native：{len(libraries['native'])}  "
+                f"缺失依赖：{len(libraries['missing'])}")
+            missing_jar = not spec.jar_path.is_file()
+            self.version_status.setText("游戏文件不完整，启动时会显示缺失详情。" if missing_jar or libraries["missing"] else "版本已就绪。")
+            self.auto_select_java()
 
-        json_file = (
-            version_dir /
-            f"{version}.json"
-        )
+        self._run_job(f"selection-{revision}", prepare, selected)
 
-        jar_file = (
-            version_dir /
-            f"{version}.jar"
-        )
+    def choose_modpack_directory(self):
+        if self.game_process is not None or "launch" in self._jobs or "modpack" in self._jobs:
+            return
+        directory = QFileDialog.getExistingDirectory(self, "选择已解压的整合包文件夹",
+            self.config["selected_modpack"] or str(self.minecraft_dir))
+        if not directory:
+            return
+        source, shared_root = Path(directory).resolve(), self.minecraft_dir
 
-        main_class = data.get(
-            "mainClass",
-            "没有找到"
-        )
+        def added(candidates):
+            names = [spec.name for spec, _ in candidates]
+            selected, accepted = QInputDialog.getItem(self, "确认整合包游戏版本",
+                "请选择此整合包对应的已安装版本（需匹配 Minecraft 和 Mod 加载器）：",
+                names, 0, False)
+            if not accepted:
+                return
+            spec, _ = next(candidate for candidate in candidates if candidate[0].name == selected)
+            path = str(source)
+            self.config["local_modpacks"] = [pack for pack in self.config["local_modpacks"]
+                if os.path.normcase(pack["path"]) != os.path.normcase(path)] + [{"path": path, "version": spec.name}]
+            self.config["selected_modpack"] = path
+            self.append_log(f"已添加本地整合包：{source}\n关联版本：{spec.name}（文件保留在原目录）")
+            self._schedule_save()
+            self.scan_versions()
 
-        libraries = data.get(
-            "libraries",
-            []
-        )
-
-        library_result = get_library_jars(
-            self.minecraft_dir,
-            data
-        )
-
-        info = (
-            f"版本：{version}\n\n"
-            f"JSON：\n"
-            f"{json_file}\n\n"
-            f"Minecraft JAR：\n"
-            f"{jar_file}\n\n"
-            f"Minecraft JAR："
-            f"{'存在' if jar_file.exists() else '不存在'}\n\n"
-            f"主类：\n"
-            f"{main_class}\n\n"
-            f"Libraries："
-            f"{len(libraries)}\n\n"
-            f"实际普通 JAR："
-            f"{len(library_result['normal'])}\n\n"
-            f"Native："
-            f"{len(library_result['native'])}\n\n"
-            f"真正缺失："
-            f"{len(library_result['missing'])}"
-        )
-
-        self.info_text.setPlainText(
-            info
-        )
-
-        self.version_status.setText(
-            f"{version}：准备完成"
-        )
-
-
-    # =====================================================
-    # 启动 Minecraft
-    # =====================================================
-    def read_minecraft_output(self, process):
-        try:
-            for line in process.stdout:
-                line = line.rstrip()
-
-                if line:
-                    print(line)
-
-                    # 把 Minecraft 日志发送到启动器窗口
-                    self.log_emitter.log_signal.emit(line)
-
-            process.wait()
-
-            message = (
-                "\n========== Minecraft 已退出 ==========\n"
-                f"退出代码：{process.returncode}"
-            )
-
-            print(message)
-            self.log_emitter.log_signal.emit(message)
-
-        except Exception as e:
-            message = (
-                f"读取 Minecraft 日志失败：{e}"
-            )
-
-            print(message)
-            self.log_emitter.log_signal.emit(message)
+        self._run_job("modpack", lambda: find_local_modpack_versions(source, shared_root), added)
 
     def login_microsoft(self):
-        try:
-            self.log_text.append(
-                "\n========== Microsoft 登录 =========="
-            )
-
-            self.log_text.append(
-                "正在打开 Microsoft 登录页面..."
-            )
-
-            app = msal.PublicClientApplication(
-                CLIENT_ID,
-                authority=AUTHORITY
-            )
-
-            result = app.acquire_token_interactive(
-                scopes=SCOPES
-            )
-
-            if "access_token" in result:
-
-                # 保存 Microsoft Access Token
-                self.microsoft_access_token = result["access_token"]
-
-                account = result.get("account")
-
-                if account:
-                    username = account.get(
-                        "username",
-                        "未知账户"
-                    )
-
-                    self.log_text.append(
-                        f"Microsoft 登录成功：{username}"
-                    )
-
-                    self.login_button.setText(
-                        f"已登录：{username}"
-                    )
-
-                else:
-                    self.log_text.append(
-                        "Microsoft 登录成功"
-                    )
-
-                # ==============================
-                # Microsoft → Xbox Live
-                # ==============================
-                self.authenticate_xbox(
-                    self.microsoft_access_token
-                )
-
-            else:
-                error = result.get(
-                    "error_description",
-                    result.get("error", "未知错误")
-                )
-
-                self.log_text.append(
-                    f"Microsoft 登录失败：{error}"
-                )
-
-        except Exception as e:
-
-            self.log_text.append(
-                f"Microsoft 登录异常：{e}"
-            )
-
-    def authenticate_xbox(self, microsoft_token):
-        try:
-            self.log_text.append("正在获取 Xbox Live Token...")
-
-            url = "https://user.auth.xboxlive.com/user/authenticate"
-
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "x-xbl-contract-version": "1"
-            }
-
-            data = {
-                "Properties": {
-                    "AuthMethod": "RPS",
-                    "SiteName": "user.auth.xboxlive.com",
-                    "RpsTicket": "d=" + microsoft_token
-                },
-                "RelyingParty": "http://auth.xboxlive.com",
-                "TokenType": "JWT"
-            }
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=data,
-                timeout=15
-            )
-
-            self.log_text.append(
-                f"Xbox Live HTTP 状态码：{response.status_code}"
-            )
-
-            if response.status_code != 200:
-                self.log_text.append(
-                    f"Xbox Live 登录失败：{response.text}"
-                )
-                return None
-
-            result = response.json()
-
-            xbox_token = result.get("Token")
-            user_hash = None
-
-            claims = result.get("DisplayClaims", {})
-            xui = claims.get("xui", [])
-
-            if xui:
-                user_hash = xui[0].get("uhs")
-
-            if not xbox_token or not user_hash:
-                self.log_text.append(
-                    "Xbox Live 返回的数据不完整"
-                )
-                return None
-
-            self.log_text.append("Xbox Live 登录成功！")
-
-            # 保存下来，后面 XSTS 要用
-            self.xbox_token = xbox_token
-            self.user_hash = user_hash
-
-            self.log_text.append("Xbox Live 登录成功！")
-
-            # 继续进行 XSTS 认证
-            self.authenticate_xsts(xbox_token)
-
-            return xbox_token, user_hash
-
-        except Exception as e:
-            self.log_text.append(
-                f"Xbox Live 登录异常：{e}"
-            )
-            return None
-
-    def authenticate_xsts(self, xbox_token):
-        try:
-            self.log_text.append("正在获取 XSTS Token...")
-
-            url = "https://xsts.auth.xboxlive.com/xsts/authorize"
-
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "x-xbl-contract-version": "1"
-            }
-
-            data = {
-                "Properties": {
-                    "SandboxId": "RETAIL",
-                    "UserTokens": [
-                        xbox_token
-                    ]
-                },
-                "RelyingParty": "rp://api.minecraftservices.com/",
-                "TokenType": "JWT"
-            }
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=data,
-                timeout=15
-            )
-
-            self.log_text.append(
-                f"XSTS HTTP 状态码：{response.status_code}"
-            )
-
-            if response.status_code != 200:
-                self.log_text.append(
-                    f"XSTS 登录失败：{response.text}"
-                )
-                return None
-
-            result = response.json()
-
-            xsts_token = result.get("Token")
-
-            if not xsts_token:
-                self.log_text.append(
-                    "XSTS 返回的数据中没有 Token"
-                )
-                return None
-
-            self.xsts_token = xsts_token
-
-            self.log_text.append(
-                "XSTS 登录成功！"
-            )
-
-            # 继续获取 Minecraft Access Token
-            self.authenticate_minecraft(xsts_token)
-
-            return xsts_token
-
-            return xsts_token
-
-        except Exception as e:
-            self.log_text.append(
-                f"XSTS 登录异常：{e}"
-            )
-
-    def authenticate_minecraft(self, xsts_token):
-        try:
-            self.log_text.append("正在获取 Minecraft Access Token...")
-
-            url = "https://api.minecraftservices.com/authentication/login_with_xbox"
-
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
-
-            data = {
-                "identityToken": f"XBL3.0 x={self.user_hash};{xsts_token}"
-            }
-
-            response = requests.post(
-                url,
-                headers=headers,
-                json=data,
-                timeout=15
-            )
-
-            self.log_text.append(
-                f"Minecraft HTTP 状态码：{response.status_code}"
-            )
-
-            if response.status_code != 200:
-                self.log_text.append(
-                    f"Minecraft 登录失败：{response.text}"
-                )
-                return None
-
-            result = response.json()
-
-            minecraft_token = result.get("access_token")
-
-            if not minecraft_token:
-                self.log_text.append(
-                    "Minecraft 返回的数据中没有 Access Token"
-                )
-                return None
-
-            self.minecraft_access_token = minecraft_token
-
-            self.log_text.append(
-                "Minecraft Access Token 获取成功！"
-            )
-
-            return minecraft_token
-
-        except Exception as e:
-            self.log_text.append(
-                f"Minecraft 登录异常：{e}"
-            )
-            return None
-
+        client_id = launcher_settings.MICROSOFT_CLIENT_ID.strip()
+        if not client_id:
+            QMessageBox.information(self, "Microsoft 登录暂不可用", "此启动器尚未配置 Microsoft 登录，请联系启动器开发者。")
+            return
+        self.microsoft_account = None
+        self._run_job("login", lambda: authenticate_microsoft(client_id, self.signals.log.emit), self._logged_in)
+
+    def _logged_in(self, account):
+        self.microsoft_account = account
+        self.config["selected_account"] = account.uuid
+        self.account_combo.setCurrentIndex(self.account_combo.findData("microsoft"))
+        self.account_type_changed(self.account_combo.currentIndex())
+        self.append_log(f"Microsoft 登录成功：{account.name}")
+        self._schedule_save()
 
     def launch_minecraft(self):
-
-        self.log_text.clear()
-
-        # -------------------------------
-        # 检查 Java
-        # -------------------------------
-
-        java_index = (
-            self.java_combo.currentIndex()
-        )
-
-        if java_index < 0:
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                "没有选择 Java"
-            )
-
+        if any(name in self._jobs for name in ("launch", "versions", "java", "login", "modpack")) or self.game_process is not None or not self.current_spec:
             return
-
-        java_path = (
-            self.java_combo.itemData(
-                java_index
-            )
-        )
-
-        if not java_path:
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                "Java 路径无效"
-            )
-
+        self.auto_select_java()
+        java = self.java_combo.currentData()
+        if not isinstance(java, JavaInfo):
             return
-
-        # -------------------------------
-        # 检查版本
-        # -------------------------------
-
-        version = (
-            self.version_combo.currentText()
-        )
-
-        if not version:
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                "没有选择 Minecraft 版本"
-            )
-
-            return
-
-        data = load_version_with_inheritance(
-            self.minecraft_dir,
-            version
-        )
-
-        if data is None:
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                "无法读取版本 JSON"
-            )
-
-            return
-
-        # -------------------------------
-        # Minecraft JAR
-        # -------------------------------
-
-        version_dir = (
-            self.minecraft_dir /
-            "versions" /
-            version
-        )
-
-        version_jar = (
-            version_dir /
-            f"{version}.jar"
-        )
-
-        if not version_jar.exists():
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                f"没有找到 Minecraft JAR：\n"
-                f"{version_jar}"
-            )
-
-            return
-
-        # -------------------------------
-        # Libraries
-        # -------------------------------
-
-        library_result = get_library_jars(
-            self.minecraft_dir,
-            data
-        )
-
-        normal_jars = (
-            library_result["normal"]
-        )
-
-        missing = (
-            library_result["missing"]
-        )
-
-        if missing:
-
-            text = (
-                "有 Libraries 缺失，暂时不能启动。\n\n"
-                f"缺失数量：{len(missing)}\n\n"
-            )
-
-            for name, path in missing[:10]:
-
-                text += (
-                    f"{name}\n"
-                    f"{path}\n\n"
-                )
-
-            QMessageBox.warning(
-                self,
-                "Libraries 缺失",
-                text
-            )
-
-            return
-
-        # -------------------------------
-        # ClassPath
-        # -------------------------------
-
-        classpath_list = []
-
-        for jar in normal_jars:
-
-            classpath_list.append(
-                str(jar)
-            )
-
-        classpath_list.append(
-            str(version_jar)
-        )
-
-        classpath = ";".join(
-            classpath_list
-        )
-
-        # -------------------------------
-        # Assets
-        # -------------------------------
-
-        assets_name = data.get(
-            "assets",
-            ""
-        )
-
-        assets_root = (
-            self.minecraft_dir /
-            "assets"
-        )
-
-        # -------------------------------
-        # 玩家信息
-        # -------------------------------
-
-        player_name = (
-            self.player_name.text().strip()
-        )
-
-        if not player_name:
-
-            player_name = "Steve"
-
-        # -------------------------------
-        # 参数变量
-        # -------------------------------
-
-        variables = {
-
-            "auth_player_name":
-                player_name,
-
-            "version_name":
-                version,
-
-            "game_directory":
-                str(self.minecraft_dir),
-
-            "assets_root":
-                str(assets_root),
-
-            "assets_index_name":
-                assets_name,
-
-            "auth_uuid":
-                "00000000-0000-0000-0000-000000000000",
-
-            "auth_access_token":
-                "0",
-
-            "user_type":
-                "legacy",
-
-            "version_type":
-                "release",
-
-            "resolution_width":
-                "854",
-
-            "resolution_height":
-                "480",
-
-            "natives_directory":
-                str(
-                    self.minecraft_dir /
-                    "natives"
-                ),
-
-            "classpath":
-                classpath
-        }
-
-        # -------------------------------
-        # JVM 参数
-        # -------------------------------
-
-        jvm_arguments = get_jvm_arguments(
-            data
-        )
-
-        processed_jvm = []
-
-        for arg in jvm_arguments:
-
-            arg = replace_placeholders(
-                arg,
-                variables
-            )
-
-            processed_jvm.append(
-                arg
-            )
-
-        # -------------------------------
-        # 游戏参数
-        # -------------------------------
-
-        game_arguments = get_game_arguments(
-            data
-        )
-
-        processed_game = []
-
-        for arg in game_arguments:
-
-            arg = replace_placeholders(
-                arg,
-                variables
-            )
-
-            processed_game.append(
-                arg
-            )
-
-        # -------------------------------
-        # 内存
-        # -------------------------------
-
-        memory = (
-            self.memory_spin.value()
-        )
-
-        # -------------------------------
-        # 构造 Java 命令
-        # -------------------------------
-        natives_directory = (
-                self.minecraft_dir /
-                "natives"
-        )
-
-        extract_natives(
-            library_result["native"],
-            natives_directory
-        )
-        command = []
-
-        command.append(
-            java_path
-        )
-
-        command.append(
-            f"-Xmx{memory}M"
-        )
-
-        command.append(
-            f"-Xms{min(memory, 1024)}M"
-        )
-
-        # JVM 参数
-        command.extend(
-            processed_jvm
-        )
-
-        # 某些 JSON 自己已经有 classpath
-        # 如果没有，我们手动加入
-        if "-cp" not in processed_jvm and "-classpath" not in processed_jvm:
-
-            command.extend([
-                "-cp",
-                classpath
-            ])
-
-        # 主类
-        main_class = data.get(
-            "mainClass"
-        )
-
-        if not main_class:
-
-            QMessageBox.warning(
-                self,
-                "启动失败",
-                "JSON 中没有 mainClass"
-            )
-
-            return
-
-        command.append(
-            main_class
-        )
-
-        # 游戏参数
-        command.extend(
-            processed_game
-        )
-
-        # -------------------------------
-        # 显示命令
-        # -------------------------------
-
-        self.log_text.append(
-            "========== Minecraft 启动 ==========\n"
-        )
-
-        self.log_text.append(
-            "Java：\n"
-            f"{java_path}\n"
-        )
-
-        self.log_text.append(
-            "版本：\n"
-            f"{version}\n"
-        )
-
-        self.log_text.append(
-            "玩家：\n"
-            f"{player_name}\n"
-        )
-
-        self.log_text.append(
-            "ClassPath 数量：\n"
-            f"{len(classpath_list)}\n"
-        )
-
-        self.log_text.append(
-            "\n========== 启动命令 ==========\n"
-        )
-
-        self.log_text.append(
-            " ".join(
-                f'"{x}"'
-                if " " in str(x)
-                else str(x)
-                for x in command
-            )
-        )
-
-        self.log_text.append(
-            "\n\n正在启动 Minecraft..."
-        )
-
-        # -------------------------------
-        # 启动
-        # -------------------------------
-
         try:
+            if self.account_type == "offline":
+                name = validate_player_name(self.player_name.text())
+                account = Account(name, get_offline_uuid(name))
+            else:
+                account = self.microsoft_account
+                if account is None:
+                    raise LauncherError("请先登录 Microsoft。")
+                if account.expires_at <= time.time() + 60:
+                    self.microsoft_account = None
+                    self._update_actions()
+                    raise LauncherError("Microsoft 登录已过期，请重新登录。")
+        except LauncherError as exc:
+            QMessageBox.warning(self, "无法启动", str(exc))
+            return
+        config, spec, game_dir = self.config.copy(), self.current_spec, self.current_game_directory
+        bounds = launcher_monitor_bounds(int(self.winId())) if config["fullscreen"] and os.name == "nt" else None
+        self.save_config()
+        self.append_log(f"\n正在准备 Minecraft {spec.name}…")
 
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1
-            )
+        def prepare():
+            plan = build_launch_plan(spec, java, game_dir, config, account,
+                                     client_id=launcher_settings.MICROSOFT_CLIENT_ID, display_bounds=bounds)
+            options = None
+            try:
+                plan.game_directory.mkdir(parents=True, exist_ok=True)
+                prepare_legacy_assets(plan.asset_files)
+                extract_natives(plan.native_jars, plan.natives_directory)
+                if plan.window_mode != "fullscreen":
+                    options = prepare_window_options(plan.game_directory)
+            except Exception:
+                if options:
+                    options.restore()
+                cleanup_natives(plan.natives_directory, plan.game_directory)
+                raise
+            return plan, account, options
 
-            self.log_text.append(
-                "\n========== Minecraft 已启动 ==========\n"
-            )
+        self._run_job("launch", prepare, self._start_game)
 
-            self.log_text.append(
-                "Minecraft 正在运行，启动器保持可用。\n"
-            )
+    def _start_game(self, result):
+        plan, account = result[:2]
+        options = result[2] if len(result) > 2 else None
+        try:
+            process = subprocess.Popen(plan.command, cwd=plan.game_directory,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                       encoding="utf-8", errors="replace", bufsize=1,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        except OSError as exc:
+            if options:
+                try:
+                    options.restore()
+                except (OSError, UnicodeError) as restore_error:
+                    self.append_log(f"恢复游戏窗口设置失败：{restore_error}")
+            cleanup_natives(plan.natives_directory, plan.game_directory)
+            self.append_log(f"启动失败：{exc}")
+            QMessageBox.warning(self, "启动失败", str(exc))
+            return
+        self.game_process = process
+        self._running_version = plan.version
+        self.version_status.setText(f"Minecraft {plan.version} 正在创建游戏窗口…" if plan.window_mode == "borderless"
+                                    else f"Minecraft {plan.version} 正在运行。")
+        self.append_log(f"启动命令：\n{redact_command(plan.command, [account.access_token], compact=True)}\n"
+                        f"Minecraft 进程已创建（PID {process.pid}）。")
+        self._game_thread = threading.Thread(target=self.read_minecraft_output, args=(process, plan, account.access_token, options),
+                                             name="minecraft-output", daemon=False)
+        self._game_thread.start()
+        if plan.window_mode == "borderless":
+            threading.Thread(target=self._prepare_borderless, args=(process, plan.display_bounds),
+                             name="minecraft-window", daemon=True).start()
 
-            thread = threading.Thread(
-                target=self.read_minecraft_output,
-                args=(process,),
-                daemon=True
-            )
+    def _prepare_borderless(self, process, bounds):
+        ready = False
+        try:
+            ready = apply_borderless_when_ready(process, bounds)
+            message = "已确认游戏窗口进入无边框全屏。" if ready else "未找到游戏窗口或全屏尺寸未生效；保留当前游戏窗口。"
+        except OSError as exc:
+            message = f"无边框全屏设置失败，保留游戏窗口：{exc}"
+        if not self._closing and process.poll() is None:
+            self.signals.log.emit(message)
+            self.signals.game_window_ready.emit(process.pid, ready)
 
-            thread.start()
+    def _game_window_ready(self, pid, fullscreen):
+        if self.game_process and self.game_process.pid == pid:
+            mode = "无边框全屏" if fullscreen else "窗口模式"
+            self.version_status.setText(f"Minecraft {self._running_version} 正在运行（{mode}）。")
 
-        except Exception as e:
+    def read_minecraft_output(self, process, plan, token, options=None):
+        code = None
+        try:
+            for line in process.stdout:
+                text = line.rstrip("\r\n")
+                if token and token != "0":
+                    text = text.replace(token, "<已隐藏>")
+                if self._closing:
+                    continue
+                with self._game_log_lock:
+                    self._game_log_lines.append(text[:4096] + ("…<长日志已截断>" if len(text) > 4096 else ""))
+            code = process.wait()
+        except (OSError, ValueError) as exc:
+            if not self._closing:
+                self.signals.log.emit(f"读取游戏日志失败：{exc}")
+            code = process.wait()
+        finally:
+            if process.stdout:
+                process.stdout.close()
+            cleanup_natives(plan.natives_directory, plan.game_directory)
+            if options:
+                try:
+                    options.restore()
+                except (OSError, UnicodeError) as exc:
+                    if not self._closing:
+                        self.signals.log.emit(f"恢复游戏窗口设置失败：{exc}")
+        if code is not None and not self._closing:
+            self.signals.game_exited.emit(code)
 
-            QMessageBox.critical(
-                self,
-                "启动失败",
-                str(e)
-            )
+    def _flush_game_log(self):
+        # A Forge startup burst must not monopolize the UI for thousands of lines.
+        with self._game_log_lock:
+            lines, size = [], 0
+            while self._game_log_lines and len(lines) < 100 and size < 16384:
+                line = self._game_log_lines.popleft()
+                lines.append(line)
+                size += len(line)
+        if lines:
+            self.append_log("\n".join(lines))
 
-            self.log_text.append(
-                f"\n启动失败：{e}"
-            )
+    def _game_exited(self, code):
+        self._flush_game_log()
+        self.game_process = None
+        self._running_version = None
+        self.append_log(f"Minecraft 已退出，退出代码：{code}")
+        self.version_status.setText("游戏已正常退出。" if code == 0 else f"游戏异常退出（{code}），请查看日志。")
+        self._update_actions()
 
+    def closeEvent(self, event):
+        if "launch" in self._jobs:
+            event.ignore()
+            self.append_log("正在准备游戏，请在准备完成后关闭启动器。")
+            return
+        if not self.save_config():
+            answer = QMessageBox.question(self, "配置未保存", "配置保存失败，仍要关闭启动器吗？")
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        # The non-daemon output reader drains the game pipe after Qt exits.
+        # No game process is terminated when the user closes the launcher.
+        self.log_timer.stop()
+        self._closing = True
+        event.accept()
 
-# =========================================================
-# 程序入口
-# =========================================================
 
 if __name__ == "__main__":
-
-    app = QApplication(
-        sys.argv
-    )
-
+    app = QApplication(sys.argv)
     window = LauncherWindow()
-
     window.show()
-
-    sys.exit(
-        app.exec()
-    )
+    sys.exit(app.exec())

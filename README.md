@@ -1,42 +1,202 @@
-# DINGDING-Minecraft-Launcher
-A Minecraft Java Edition launcher written in Python and PySide6.
-# DINGDING Launcher
+# DINGDING Minecraft Launcher
 
-DINGDING Launcher is a Minecraft Java Edition launcher developed with Python and PySide6.
+一个使用 **Python + PySide6** 编写的 Minecraft Java 版本地启动器，主要面向 Windows。
 
-## Features
+支持启动已有游戏版本和已解压、已安装的整合包，自动匹配 Java，并区分原版、Mod 版本和整合包。
 
-* Minecraft Java Edition version detection
-* Automatic Java installation detection
-* Java version selection
-* Minecraft version selection
-* Memory configuration
-* JVM argument configuration
-* Real-time Minecraft log display
-* Microsoft account authentication
-* Xbox Live authentication
-* XSTS authentication
-* Minecraft Services authentication
+> 当前项目侧重“启动已有游戏”，不提供游戏下载、加载器安装或整合包压缩文件导入。运行启动器的 Python 和运行游戏的 Java 需要分别安装。
 
-## Technology
+更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
-* Python
-* PySide6
-* MSAL
-* Requests
+## 已实现的功能
 
-## Project Status
+- **本地版本启动**：扫描已安装版本，解析版本继承、旧版与新版启动参数，并检查游戏 JAR 和依赖。
+- **整合包启动**：添加任意位置的已安装整合包，使用其原有 Mod、配置和存档；支持版本隔离目录及固定实例目录。
+- **自动分类与去重**：按实际主类、加载器依赖和游戏目录内容识别类型，同一版本与游戏目录不会重复显示。
+- **Java 管理**：扫描本地 Java、自动匹配版本与架构，也可手动选择；支持识别 Oracle Java 路径代理背后的运行环境。
+- **账户登录**：支持离线昵称和 Microsoft 登录。Microsoft 登录需要开发者预先配置应用 Client ID。
+- **启动设置**：设置最大内存、窗口宽高及全屏；Windows 使用无边框全屏。
+- **日志与后台任务**：后台扫描、登录和启动准备，实时显示游戏输出，分批刷新日志。
+- **配置与进程管理**：记住设置及整合包路径，防止重复启动；关闭启动器窗口不会强制终止游戏。
 
-DINGDING Launcher is currently under active development.
+## 环境要求
 
-The launcher is designed to provide a simple and lightweight Minecraft Java Edition launching experience.
+- Windows 为主要支持平台；其他平台的完整兼容性尚未验证。
+- Python 3.10 或以上版本。
+- 与目标 Minecraft / 整合包兼容的 Java。启动器能匹配已安装的 Java，但不会下载 Java。
+- 已安装完整的游戏文件，包括所需的版本、加载器、libraries、assets 和 Native 依赖。
+- 使用 Microsoft 登录时，需要网络连接及拥有可用 Minecraft Java 玩家资料的账户。
 
-## Authentication
+Python 依赖见 [requirements.txt](requirements.txt)：`PySide6`、`msal`、`requests`。
 
-The launcher uses Microsoft's official authentication flow for Microsoft account login.
+## 从源码运行
 
-The launcher does not directly collect or store the user's Microsoft account password.
+下载或克隆本仓库，在项目目录打开 PowerShell：
 
-## Developer
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
+```
 
-DINGDING Launcher is an independent third-party project and is not affiliated with Mojang Studios or Microsoft.
+不需要激活虚拟环境，直接使用其中的 Python 即可。
+
+### 启动已有游戏
+
+1. 点击“选择游戏目录”，选择包含 `versions`、`libraries`、`assets` 的游戏根目录。
+2. 点击“扫描版本”，选择需要启动的版本。
+3. 保持“自动匹配”勾选，或通过“手动选择”指定 Java。
+4. 选择账户类型。离线账户填写昵称；Microsoft 账户点击“登录 Microsoft”。
+5. 设置内存、窗口或全屏，点击“启动 Minecraft”。
+
+离线昵称允许 1–16 个英文字母、数字或下划线。离线模式不提供 Microsoft 身份认证，不能替代正版账户访问需要认证的服务。
+
+缺失文件会在启动前提示，需要自行补齐或用原启动器完成安装。
+
+## Microsoft 登录配置
+
+此项由启动器开发者配置，用户界面不提供 Client ID 输入框。
+
+在 [launcher_settings.py](launcher_settings.py) 中填写已配置相应 Microsoft / Xbox / Minecraft 登录权限的应用 ID：
+
+```python
+MICROSOFT_CLIENT_ID = "你的应用 Client ID"
+```
+
+仅填写 ID 不保证认证可用，应用需具备相应配置和权限。此代码使用公共客户端登录，不需要在源码中填写 Client Secret，**不要提交密码、Client Secret 或登录 Token**。
+
+终端用户直接点击“登录 Microsoft”。未配置时会提示登录暂不可用，离线账户不受影响。登录凭据仅保存在当前进程中，不写入启动器配置；重启启动器或凭据过期后需要重新登录。配置中的离线昵称不会被正版昵称覆盖。
+
+## Java 自动匹配
+
+Java 默认启用“自动匹配”：按当前版本重新选择相应主版本和架构，优先精确匹配，再考虑更高主版本。上次使用的较高版本不会覆盖精确匹配；32 位 Java 会受内存与现代游戏版本限制。手动选择会关闭自动匹配，重新勾选即可恢复。
+
+较高版本 Java 不一定兼容所有旧版 Mod 或整合包；若出现兼容性问题，可按整合包要求手动选择。扫描不到兼容环境时会提示，但不会自动安装 Java。
+
+Java 检测同时读取 `java.home`。如果用户选择的是 Oracle `javapath` / `java8path` 代理，启动游戏时会直接使用同一运行环境的 `bin/java.exe`，保留界面与配置中的原选择。这保证进程跟踪和全屏窗口匹配使用真正的游戏 PID，不会因代理另起子进程而停留在小窗口。
+
+## 全屏与窗口行为
+
+Windows 上的“全屏”使用无边框全屏，不主动切换桌面分辨率或刷新率。
+
+- 现代版本按目标显示器尺寸创建窗口。
+- LWJGL 2 旧版（包括 1.12.2、基于它的 Forge / OptiFine）从小尺寸、无标题栏窗口初始化，稳定后按游戏窗口自身的 DPI 坐标扩展，以改善高缩放下放大、裁切和过渡问题。
+- 调整结果会检查并有限重试，不在游戏运行期间反复拉伸窗口；失败时保留当前窗口并写入日志。
+- 游戏内 F11 仍由 Minecraft 处理，旧版切回窗口后可能仍保留无边框样式。
+- 其他平台使用游戏原生全屏，其行为与 Windows 不同。
+
+启动时可能临时调整 `options.txt` 的全屏、窗口尺寸覆盖项，正常退出后合并恢复，保留游戏期间修改的其他设置。这不是“启动过程中完全不写文件”；异常中断可能导致恢复无法完成。
+
+## 配置、日志与游戏进程
+
+Windows 配置位置：
+
+```text
+%APPDATA%\DINGDINGLauncher\config.json
+```
+
+配置包含游戏目录、Java 选择、内存、账户类型、离线昵称、窗口设置及整合包路径，使用原子替换保存，兼容已有配置。
+
+界面日志使用纯文本，对当前账户 Token 做脱敏；分批刷新并限制行数和文本量，减少大量日志对界面的影响。启动命令中的长 ClassPath 以文件数量展示。公开游戏或 Mod 自己生成的日志前，仍需自行检查个人路径和账户信息。
+
+游戏运行时禁止重复启动。关闭启动器窗口不会停止游戏；后台进程继续读取游戏输出，游戏退出后自动清理该次运行的 Native 文件。
+
+## 本地整合包
+
+“已解压”不一定代表“已安装”。此功能需要实际可启动的游戏目录，而不仅是整合包发布文件。已安装好游戏文件的整合包可以放在任意目录：
+
+1. 点击版本栏旁的“添加本地整合包”。
+2. 选择整合包根目录、其 `.minecraft` / `minecraft` 子目录，或 `versions/整合包版本` 隔离目录。
+3. 确认对应的已安装游戏版本，再点击“启动 Minecraft”。
+
+启动器记住文件夹路径和关联版本，下次可直接在版本列表中选择。Mod、配置和存档始终在原游戏目录中使用，不复制或移动文件。只有 `mods/config` 的目录也可手动关联主游戏目录中已安装的 Mod 加载器版本；需自行确认 Minecraft 和 Forge / Fabric 等加载器版本兼容。检测到 Mod JAR 时不会用原版配置启动。
+
+主游戏目录中已经位于 `versions/包名`、且带有 `mods/config/saves` 的隔离整合包，也可以直接从原版本列表选择，启动时会使用该包的目录，而不是主目录。
+
+常见目录示例：
+
+```text
+.minecraft/
+├── assets/
+├── libraries/
+└── versions/
+    └── 我的整合包/
+        ├── 我的整合包.json
+        ├── 我的整合包.jar    # 某些版本通过继承使用父版本 JAR
+        ├── mods/
+        ├── config/
+        └── saves/
+```
+
+此功能不导入压缩包、不下载游戏或 Mod、不执行整合包自带的 EXE/BAT。只有 manifest / index / overrides 的已解压分发包通常仍未安装，需先用原启动器完成安装，再选择实际游戏文件夹。缺少版本、加载器或依赖时会提示原因。
+
+### 固定实例目录
+
+实例位于 `游戏目录/instances/实例名称`；游戏文件可位于实例根目录、`.minecraft` 或 `minecraft` 子目录。
+
+最直接的关联方式是在实例根目录创建 `instance.json`，填写 **已经安装好的** 版本目录名称：
+
+```json
+{"version_id": "1.20.1-Fabric", "name": "我的整合包"}
+```
+
+实例可复用主游戏目录中的版本、libraries 和 assets。实例内只有一个本地版本时可以自动识别。已展开的 CurseForge `manifest.json` 或 Modrinth `modrinth.index.json` 可根据游戏版本和加载器信息匹配本地版本；多个候选或未安装的版本会给出提示。这不等同于导入、下载整合包压缩文件，也不保证兼容其他启动器的实例格式。
+
+## 版本识别与去重
+
+“扫描版本”会自动分类并分组显示。识别依据是版本 JSON 的实际主类、继承后的加载器依赖，以及实际游戏目录内容，不根据昵称猜测。
+
+| 列表类型 | 识别方式 |
+| --- | --- |
+| 原版 | 已识别的原版主类，且没有检测到 Mod 后端 |
+| Mod 版本 | 带 Forge、Fabric、Quilt、NeoForge、LiteLoader 等加载器，但没有检测到已安装 Mod；OptiFine 也归入此类 |
+| 整合包 | 已识别加载器并存在 Mod JAR，或具有整合包元数据 / 已手动添加为整合包 |
+| 未识别 | 无法确认类型的自定义主类或无法解析的版本 |
+
+自动扫描到的隔离整合包无需逐个手动添加。只有存档、配置或空 `mods` 文件夹不会使原版被判为整合包；共享目录中原版不会加载的 Mod 文件也不会改变其分类。
+
+分类是本地文件启发式识别，并不验证整合包来源、完整性或 Mod 兼容性。“未识别”不直接禁止启动，仍需通过原有文件和依赖检查。
+
+同一个版本 JSON 和实际游戏目录只显示一次，优先保留手动添加的整合包条目；不同目录的同名包不会合并。包名和版本名相同时，不再重复显示括号中的名称。
+
+版本信息及悬停提示显示类型和实际游戏目录；旧版保存的选择自动迁移，刷新时类型发生变化仍保留对应版本。识别只读取已有文件，不移动文件、不改写整合包配置。
+
+## 当前限制
+
+- 不下载 Minecraft、Java、libraries、assets 或 Mod。
+- 不安装 Forge / Fabric 等加载器，不导入 ZIP / `.mrpack` 压缩包。
+- 不保证兼容所有第三方启动器实例格式或所有整合包。
+- 分类结果不等于整合包完整性检查或 Mod 安全检查。
+- Microsoft 登录依赖开发者的应用配置、账户状态和网络，尚不支持多账户持久登录。
+- 主要在 Windows 上开发和验证；其他平台及部分旧版 / Mod 的窗口行为可能不同。
+
+## 开发与测试
+
+- `main.py`：界面、后台任务、配置交互和游戏进程管理。
+- `launcher_core.py`：配置校验、Java 检测、版本继承、分类去重、实例解析、依赖检查和启动命令。
+- `launcher_auth.py`：Microsoft、Xbox、XSTS 和 Minecraft 认证。
+- `launcher_settings.py`：启动器作者填写 Microsoft Client ID 的位置。
+- `launcher_display.py`：全屏窗口过渡和临时游戏窗口设置。
+- `tests/`：核心、认证、显示与界面回归测试。
+- `CHANGELOG.md`：版本更新记录。
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+当前代码已通过 118 项回归测试。核心测试不依赖 Qt；安装依赖后还会运行离屏界面测试。测试使用临时目录和模拟，不修改真实游戏和启动器配置，也不触发实际 Microsoft 登录。这不代表所有游戏版本均已实机验证。
+
+### 反馈问题
+
+提交 Issue 时请说明启动器代码版本、Windows 版本、Minecraft / 加载器版本、Java 版本与架构、复现步骤；窗口问题请补充屏幕分辨率和缩放比例。
+
+附上已脱敏的相关日志。游戏或 Mod 自己生成的日志可能包含个人路径和账户信息，不要上传整个游戏目录、存档或登录凭据。
+
+## 发布到 GitHub 前
+
+- 检查暂存区，排除 `.venv`、`.idea`、本地备份、游戏日志、JVM 崩溃报告、配置及个人数据。
+- `.gitignore` 只影响未跟踪文件，不能自动移除已经跟踪或暂存的文件。
+- 发布更新时，将 [CHANGELOG.md](CHANGELOG.md) 中“未发布”的内容整理为实际版本号与发布日期。
+- 本仓库当前未附带 `LICENSE` 文件。若要明确授权他人使用、修改或分发，请在发布前选择并补充许可证。
+
+本项目是独立的第三方启动器，与 Mojang / Microsoft 无隶属关系，不包含 Minecraft 游戏文件。
